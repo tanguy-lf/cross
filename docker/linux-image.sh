@@ -59,8 +59,8 @@ main() {
     local arch="${1}" \
         kversion=5.10.0-16
 
-    local debsource="deb http://http.debian.net/debian/ bullseye main"
-    debsource="${debsource}\ndeb http://security.debian.org/ bullseye-security main"
+    local debsource="deb http://http.debian.net/debian/ bookworm main"
+    debsource="${debsource}\ndeb http://security.debian.org/ bookworm-security main"
 
     local dropbear="dropbear-bin"
 
@@ -73,7 +73,7 @@ main() {
     case "${arch}" in
         aarch64)
             arch=arm64
-            kernel="${kversion}-arm64"
+            kernel="6.1.0-9-arm64"
             deps=(libcrypt1:"${arch}")
             ;;
         armv7)
@@ -198,10 +198,10 @@ main() {
     dpkg --add-architecture "${arch}" || echo "foreign-architecture ${arch}" > /etc/dpkg/dpkg.cfg.d/multiarch
 
     # Add Debian keys.
-    curl --retry 3 -sSfL 'https://ftp-master.debian.org/keys/archive-key-{7.0,8,9,10,11}.asc' -O
-    curl --retry 3 -sSfL 'https://ftp-master.debian.org/keys/archive-key-{8,9,10,11}-security.asc' -O
+    curl --retry 3 -sSfL 'https://ftp-master.debian.org/keys/archive-key-{7.0,8,9,10,11,12}.asc' -O
+    curl --retry 3 -sSfL 'https://ftp-master.debian.org/keys/archive-key-{8,9,10,11,12}-security.asc' -O
     curl --retry 3 -sSfL 'https://ftp-master.debian.org/keys/release-{7,8,9,10,11}.asc' -O
-    curl --retry 3 -sSfL 'https://www.ports.debian.org/archive_{2020,2021,2022}.key' -O
+    curl --retry 3 -sSfL 'https://www.ports.debian.org/archive_{2020,2021,2022,2023}.key' -O
 
     for key in *.asc *.key; do
         apt-key add "${key}"
