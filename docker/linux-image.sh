@@ -73,7 +73,7 @@ main() {
     case "${arch}" in
         aarch64)
             arch=arm64
-            kernel="6.1.0-9-arm64"
+            kernel="6.1.0-11-arm64"
             deps=(libcrypt1:"${arch}")
             ;;
         armv7)
