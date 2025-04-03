@@ -115,6 +115,24 @@ run = true
 runners = "native qemu-user qemu-system"
 
 [[target]]
+target = "loongarch64-unknown-linux-gnu"
+os = "ubuntu-latest"
+cpp = true
+dylib = true
+std = true
+run = true
+runners = "qemu-user"
+
+[[target]]
+target = "loongarch64-unknown-linux-musl"
+os = "ubuntu-latest"
+cpp = true
+dylib = true
+std = true
+run = true
+runners = "qemu-user"
+
+[[target]]
 target = "mips-unknown-linux-gnu"
 os = "ubuntu-latest"
 cpp = true
@@ -122,6 +140,7 @@ dylib = true
 std = true
 run = true
 runners = "qemu-user"
+build-std = true
 
 [[target]]
 target = "mipsel-unknown-linux-gnu"
@@ -131,6 +150,7 @@ dylib = true
 std = true
 run = true
 runners = "qemu-user qemu-system"
+build-std = true
 
 [[target]]
 target = "mips64-unknown-linux-gnuabi64"
@@ -139,6 +159,7 @@ cpp = true
 dylib = true
 std = true
 run = true
+build-std = true
 
 [[target]]
 target = "mips64el-unknown-linux-gnuabi64"
@@ -148,22 +169,27 @@ dylib = true
 std = true
 run = true
 runners = "qemu-user qemu-system"
+build-std = true
 
 [[target]]
+disabled = true # https://github.com/cross-rs/cross/issues/1422
 target = "mips64-unknown-linux-muslabi64"
 os = "ubuntu-latest"
 cpp = true
 dylib = true
 std = true
 run = true
+build-std = true
 
 [[target]]
+disabled = true # https://github.com/cross-rs/cross/issues/1422
 target = "mips64el-unknown-linux-muslabi64"
 os = "ubuntu-latest"
 # FIXME: Lacking partial C++ support due to missing compiler builtins.
 cpp = true
 std = true
 run = true
+build-std = true
 
 [[target]]
 target = "powerpc-unknown-linux-gnu"
@@ -296,20 +322,24 @@ run = true
 runners = "qemu-user"
 
 [[target]]
+disabled = true # https://github.com/cross-rs/cross/issues/1422
 target = "mips-unknown-linux-musl"
 os = "ubuntu-latest"
 cpp = true
 dylib = true
 std = true
 run = true
+build-std = true
 
 [[target]]
+disabled = true # https://github.com/cross-rs/cross/issues/1422
 target = "mipsel-unknown-linux-musl"
 os = "ubuntu-latest"
 cpp = true
 dylib = true
 std = true
 run = true
+build-std = true
 
 [[target]]
 target = "aarch64-linux-android"
@@ -372,13 +402,14 @@ cpp = true
 std = true
 run = true
 
+[[target]]
 # Disabled for now, see https://github.com/rust-lang/rust/issues/98216 & https://github.com/cross-rs/cross/issues/634
-# [[target]]
-# target = "asmjs-unknown-emscripten"
-# os = "ubuntu-latest"
-# cpp = true
-# std = true
-# run = true
+disabled = true
+target = "asmjs-unknown-emscripten"
+os = "ubuntu-latest"
+cpp = true
+std = true
+run = true
 
 [[target]]
 target = "wasm32-unknown-emscripten"
@@ -410,6 +441,14 @@ dylib = true
 std = true
 
 [[target]]
+target = "aarch64-unknown-freebsd"
+os = "ubuntu-latest"
+cpp = true
+dylib = true
+std = true
+build-std = true
+
+[[target]]
 target = "x86_64-unknown-netbsd"
 os = "ubuntu-latest"
 cpp = true
@@ -424,7 +463,7 @@ dylib = true
 std = true
 
 [[target]]
-target = "x86_64-sun-solaris"
+target = "x86_64-pc-solaris"
 os = "ubuntu-latest"
 cpp = true
 dylib = true

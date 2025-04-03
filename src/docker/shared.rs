@@ -5,19 +5,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{env, fs, time};
 
 use super::custom::{Dockerfile, PreBuild};
-use super::engine::*;
 use super::image::PossibleImage;
 use super::Image;
 use super::PROVIDED_IMAGES;
+use super::{engine::*, ProvidedImage};
 use crate::cargo::CargoMetadata;
-use crate::config::{bool_from_envvar, Config};
+use crate::config::Config;
 use crate::errors::*;
 use crate::extensions::{CommandExt, SafeCommand};
 use crate::file::{self, write_file, PathExt, ToUtf8};
 use crate::id;
 use crate::rustc::QualifiedToolchain;
 use crate::shell::{ColorChoice, MessageInfo, Verbosity};
-use crate::{CargoVariant, OutputExt, Target, TargetTriple};
+use crate::{CommandVariant, OutputExt, Target, TargetTriple};
 
 use rustc_version::Version as RustcVersion;
 
@@ -26,6 +26,11 @@ pub use super::custom::CROSS_CUSTOM_DOCKERFILE_IMAGE_PREFIX;
 pub const CROSS_IMAGE: &str = "ghcr.io/cross-rs";
 // note: this is the most common base image for our images
 pub const UBUNTU_BASE: &str = "ubuntu:20.04";
+pub const DEFAULT_IMAGE_VERSION: &str = if crate::commit_info().is_empty() {
+    env!("CARGO_PKG_VERSION")
+} else {
+    "main"
+};
 
 #[derive(Debug)]
 pub struct DockerOptions {
@@ -33,9 +38,10 @@ pub struct DockerOptions {
     pub target: Target,
     pub config: Config,
     pub image: Image,
-    pub cargo_variant: CargoVariant,
+    pub command_variant: CommandVariant,
     // not all toolchains will provide this
     pub rustc_version: Option<RustcVersion>,
+    pub interactive: bool,
 }
 
 impl DockerOptions {
@@ -44,16 +50,18 @@ impl DockerOptions {
         target: Target,
         config: Config,
         image: Image,
-        cargo_variant: CargoVariant,
+        cargo_variant: CommandVariant,
         rustc_version: Option<RustcVersion>,
+        interactive: bool,
     ) -> DockerOptions {
         DockerOptions {
             engine,
             target,
             config,
             image,
-            cargo_variant,
+            command_variant: cargo_variant,
             rustc_version,
+            interactive,
         }
     }
 
@@ -69,15 +77,8 @@ impl DockerOptions {
 
     #[must_use]
     pub fn needs_custom_image(&self) -> bool {
-        self.config
-            .dockerfile(&self.target)
-            .unwrap_or_default()
-            .is_some()
-            || self
-                .config
-                .pre_build(&self.target)
-                .unwrap_or_default()
-                .is_some()
+        self.config.dockerfile(&self.target).is_some()
+            || self.config.pre_build(&self.target).is_some()
     }
 
     pub(crate) fn custom_image_build(
@@ -90,8 +91,8 @@ impl DockerOptions {
             msg_info.note("cannot install armhf system packages via apt for `arm-unknown-linux-gnueabihf`, since they are for ARMv7a targets but this target is ARMv6. installation of all packages for the armhf architecture has been blocked.")?;
         }
 
-        if let Some(path) = self.config.dockerfile(&self.target)? {
-            let context = self.config.dockerfile_context(&self.target)?;
+        if let Some(path) = self.config.dockerfile(&self.target) {
+            let context = self.config.dockerfile_context(&self.target);
 
             let is_custom_image = self.config.image(&self.target)?.is_some();
 
@@ -111,13 +112,13 @@ impl DockerOptions {
                     self,
                     paths,
                     self.config
-                        .dockerfile_build_args(&self.target)?
+                        .dockerfile_build_args(&self.target)
                         .unwrap_or_default(),
                     msg_info,
                 )
                 .wrap_err("when building dockerfile")?;
         }
-        let pre_build = self.config.pre_build(&self.target)?;
+        let pre_build = self.config.pre_build(&self.target);
 
         if let Some(pre_build) = pre_build {
             match pre_build {
@@ -260,7 +261,7 @@ pub struct ToolchainDirectories {
 }
 
 impl ToolchainDirectories {
-    pub fn assemble(mount_finder: &MountFinder, mut toolchain: QualifiedToolchain) -> Result<Self> {
+    pub fn assemble(mount_finder: &MountFinder, toolchain: QualifiedToolchain) -> Result<Self> {
         let home_dir =
             home::home_dir().ok_or_else(|| eyre::eyre!("could not find home directory"))?;
         let cargo = home::cargo_home()?;
@@ -307,8 +308,6 @@ impl ToolchainDirectories {
 
         let cargo = mount_finder.find_mount_path(cargo);
         let xargo = mount_finder.find_mount_path(xargo);
-
-        toolchain.set_sysroot(|p| mount_finder.find_mount_path(p));
 
         // canonicalize these once to avoid syscalls
         let sysroot_mount_path = toolchain.get_sysroot().as_posix_absolute()?;
@@ -410,30 +409,29 @@ pub struct PackageDirectories {
 impl PackageDirectories {
     pub fn assemble(
         mount_finder: &MountFinder,
-        mut metadata: CargoMetadata,
+        metadata: CargoMetadata,
         cwd: &Path,
     ) -> Result<(Self, CargoMetadata)> {
         let target = &metadata.target_directory;
         // see ToolchainDirectories::assemble for creating directories
         create_target_dir(target)?;
 
-        metadata.target_directory = mount_finder.find_mount_path(target);
-
         // root is either workspace_root, or, if we're outside the workspace root, the current directory
-        let host_root = mount_finder.find_mount_path(if metadata.workspace_root.starts_with(cwd) {
+        let host_root = if metadata.workspace_root.starts_with(cwd) {
             cwd
         } else {
             &metadata.workspace_root
-        });
+        }
+        .to_path_buf();
 
         // on Windows, we can not mount the directory name directly. Instead, we use wslpath to convert the path to a linux compatible path.
         // NOTE: on unix, host root has already found the mount path
         let mount_root = host_root.as_posix_absolute()?;
-        let mount_cwd = mount_finder.find_path(cwd, false)?;
+        let mount_cwd = cwd.as_posix_absolute()?;
 
         Ok((
             PackageDirectories {
-                target: metadata.target_directory.clone(),
+                target: mount_finder.find_mount_path(target),
                 host_root,
                 mount_root,
                 mount_cwd,
@@ -816,7 +814,7 @@ const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55
 # This file is a cache directory tag created by cross.
 # For information about cache directory tags see https://bford.info/cachedir/";
 
-fn create_target_dir(path: &Path) -> Result<()> {
+pub fn create_target_dir(path: &Path) -> Result<()> {
     // cargo creates all paths to the target directory, and writes
     // a cache dir tag only if the path doesn't previously exist.
     if !path.exists() {
@@ -891,7 +889,7 @@ impl Engine {
         docker.arg(UBUNTU_BASE);
         docker.args(["sh", "-c", cmd]);
 
-        docker.run(msg_info, false).map_err(Into::into)
+        docker.run(msg_info, false)
     }
 }
 
@@ -911,7 +909,7 @@ fn validate_env_var<'a>(
         && !*warned
         && !var
             .chars()
-            .all(|c| matches!(c, 'a'..='z' | 'A'..='Z' | '_' ))
+            .all(|c| matches!(c, 'a'..='z' | 'A'..='Z' | '_' | '0'..='9'))
     {
         msg_info.warn(format_args!(
             "got {var_type} of \"{var}\" which is not a valid environment variable name. the proper syntax is {var_syntax}"
@@ -928,8 +926,8 @@ fn validate_env_var<'a>(
     Ok((key, value))
 }
 
-impl CargoVariant {
-    pub(crate) fn safe_command(self) -> SafeCommand {
+impl CommandVariant {
+    pub(crate) fn safe_command(&self) -> SafeCommand {
         SafeCommand::new(self.to_str())
     }
 }
@@ -944,7 +942,7 @@ pub(crate) trait DockerCommandExt {
     ) -> Result<()>;
     fn add_cwd(&mut self, paths: &DockerPaths) -> Result<()>;
     fn add_build_command(&mut self, dirs: &ToolchainDirectories, cmd: &SafeCommand) -> &mut Self;
-    fn add_user_id(&mut self, engine_type: EngineType);
+    fn add_user_id(&mut self, is_rootless: bool);
     fn add_userns(&mut self);
     fn add_seccomp(
         &mut self,
@@ -1014,7 +1012,7 @@ impl DockerCommandExt for Command {
         let mut warned = false;
         for ref var in options
             .config
-            .env_passthrough(&options.target)?
+            .env_passthrough(&options.target)
             .unwrap_or_default()
         {
             validate_env_var(
@@ -1030,10 +1028,9 @@ impl DockerCommandExt for Command {
             self.args(["-e", var]);
         }
 
-        let runner = options.config.runner(&options.target)?;
+        let runner = options.config.runner(&options.target);
         let cross_runner = format!("CROSS_RUNNER={}", runner.unwrap_or_default());
-        self.args(["-e", "PKG_CONFIG_ALLOW_CROSS=1"])
-            .args(["-e", &format!("XARGO_HOME={}", dirs.xargo_mount_path())])
+        self.args(["-e", &format!("XARGO_HOME={}", dirs.xargo_mount_path())])
             .args(["-e", &format!("CARGO_HOME={}", dirs.cargo_mount_path())])
             .args([
                 "-e",
@@ -1041,7 +1038,7 @@ impl DockerCommandExt for Command {
             ])
             .args(["-e", "CARGO_TARGET_DIR=/target"])
             .args(["-e", &cross_runner]);
-        if options.cargo_variant.uses_zig() {
+        if options.command_variant.uses_zig() {
             // otherwise, zig has a permission error trying to create the cache
             self.args(["-e", "XDG_CACHE_HOME=/target/.zig-cache"]);
         }
@@ -1091,17 +1088,10 @@ impl DockerCommandExt for Command {
         self.args(["sh", "-c", &build_command])
     }
 
-    fn add_user_id(&mut self, engine_type: EngineType) {
+    fn add_user_id(&mut self, is_rootless: bool) {
         // by default, docker runs as root so we need to specify the user
         // so the resulting file permissions are for the current user.
         // since we can have rootless docker, we provide an override.
-        let is_rootless = env::var("CROSS_ROOTLESS_CONTAINER_ENGINE")
-            .ok()
-            .and_then(|s| match s.as_ref() {
-                "auto" => None,
-                b => Some(bool_from_envvar(b)),
-            })
-            .unwrap_or_else(|| engine_type != EngineType::Docker);
         if !is_rootless {
             self.args(["--user", &format!("{}:{}", user_id(), group_id(),)]);
         }
@@ -1172,7 +1162,7 @@ impl DockerCommandExt for Command {
         let mut warned = false;
         for ref var in options
             .config
-            .env_volumes(&options.target)?
+            .env_volumes(&options.target)
             .unwrap_or_default()
         {
             let (var, value) = validate_env_var(
@@ -1198,10 +1188,7 @@ impl DockerCommandExt for Command {
             if let Ok(val) = value {
                 let canonical_path = file::canonicalize(&val)?;
                 let host_path = paths.mount_finder.find_path(&canonical_path, true)?;
-                let absolute_path = Path::new(&val).as_posix_absolute()?;
-                let mount_path = paths
-                    .mount_finder
-                    .find_path(Path::new(&absolute_path), true)?;
+                let mount_path = Path::new(&val).as_posix_absolute()?;
                 mount_cb(self, host_path.as_ref(), mount_path.as_ref())?;
                 self.args(["-e", &format!("{}={}", var, mount_path)]);
                 store_cb((val, mount_path));
@@ -1214,10 +1201,7 @@ impl DockerCommandExt for Command {
             // to the mounted project directory.
             let canonical_path = file::canonicalize(path)?;
             let host_path = paths.mount_finder.find_path(&canonical_path, true)?;
-            let absolute_path = Path::new(path).as_posix_absolute()?;
-            let mount_path = paths
-                .mount_finder
-                .find_path(Path::new(&absolute_path), true)?;
+            let mount_path = path.as_posix_absolute()?;
             mount_cb(self, host_path.as_ref(), mount_path.as_ref())?;
             store_cb((path.to_utf8()?.to_owned(), mount_path));
         }
@@ -1234,76 +1218,96 @@ pub(crate) fn group_id() -> String {
     env::var("CROSS_CONTAINER_GID").unwrap_or_else(|_| id::group().to_string())
 }
 
-/// Simpler version of [get_image]
-pub fn get_image_name(config: &Config, target: &Target, uses_zig: bool) -> Result<String> {
-    if let Some(image) = config.image(target)? {
-        return Ok(image.name);
+#[derive(Debug, thiserror::Error)]
+pub enum GetImageError {
+    #[error(
+        "`cross` does not provide a Docker image for target {0}, \
+    specify a custom image in `Cross.toml`."
+    )]
+    NoCompatibleImages(String),
+    #[error("platforms for provided image `{0}` are not specified, this is a bug in cross")]
+    SpecifiedImageNoPlatform(String),
+    #[error(transparent)]
+    MultipleImages(eyre::Report),
+    #[error(transparent)]
+    Other(eyre::Report),
+}
+
+fn get_target_name(target: &Target, uses_zig: bool) -> &str {
+    if uses_zig {
+        "zig"
+    } else {
+        target.triple()
+    }
+}
+
+fn get_user_image(
+    config: &Config,
+    target: &Target,
+    uses_zig: bool,
+) -> Result<Option<PossibleImage>, GetImageError> {
+    let mut image = if uses_zig {
+        config.zig_image(target)
+    } else {
+        config.image(target)
+    }
+    .map_err(GetImageError::Other)?;
+
+    if let Some(image) = &mut image {
+        let target_name = get_target_name(target, uses_zig);
+        image.reference.ensure_qualified(target_name);
     }
 
-    let target_name = match uses_zig {
-        true => match config.zig_image(target)? {
-            Some(image) => return Ok(image.name),
-            None => "zig",
-        },
-        false => target.triple(),
-    };
+    Ok(image)
+}
+
+fn get_provided_images_for_target(
+    target_name: &str,
+) -> Result<Vec<&'static ProvidedImage>, GetImageError> {
     let compatible = PROVIDED_IMAGES
         .iter()
         .filter(|p| p.name == target_name)
         .collect::<Vec<_>>();
 
     if compatible.is_empty() {
-        eyre::bail!(
-            "`cross` does not provide a Docker image for target {target_name}, \
-                   specify a custom image in `Cross.toml`."
-        );
+        return Err(GetImageError::NoCompatibleImages(target_name.to_owned()));
     }
 
-    let version = if crate::commit_info().is_empty() {
-        env!("CARGO_PKG_VERSION")
-    } else {
-        "main"
-    };
-
-    Ok(compatible
-        .get(0)
-        .expect("should not be empty")
-        .image_name(CROSS_IMAGE, version))
+    Ok(compatible)
 }
 
-pub(crate) fn get_image(config: &Config, target: &Target, uses_zig: bool) -> Result<PossibleImage> {
-    if let Some(image) = config.image(target)? {
+/// Simpler version of [get_image]
+pub fn get_image_name(
+    config: &Config,
+    target: &Target,
+    uses_zig: bool,
+) -> Result<String, GetImageError> {
+    if let Some(image) = get_user_image(config, target, uses_zig)? {
+        return Ok(image.reference.get().to_owned());
+    }
+
+    let target_name = get_target_name(target, uses_zig);
+    let compatible = get_provided_images_for_target(target_name)?;
+    Ok(compatible
+        .first()
+        .expect("should not be empty")
+        .default_image_name())
+}
+
+pub fn get_image(
+    config: &Config,
+    target: &Target,
+    uses_zig: bool,
+) -> Result<PossibleImage, GetImageError> {
+    if let Some(image) = get_user_image(config, target, uses_zig)? {
         return Ok(image);
     }
 
-    let target_name = match uses_zig {
-        true => match config.zig_image(target)? {
-            Some(image) => return Ok(image),
-            None => "zig",
-        },
-        false => target.triple(),
-    };
-    let compatible = PROVIDED_IMAGES
-        .iter()
-        .filter(|p| p.name == target_name)
-        .collect::<Vec<_>>();
-
-    if compatible.is_empty() {
-        eyre::bail!(
-            "`cross` does not provide a Docker image for target {target_name}, \
-               specify a custom image in `Cross.toml`."
-        );
-    }
-
-    let version = if crate::commit_info().is_empty() {
-        env!("CARGO_PKG_VERSION")
-    } else {
-        "main"
-    };
-
-    let pick = if compatible.len() == 1 {
+    let target_name = get_target_name(target, uses_zig);
+    let compatible = get_provided_images_for_target(target_name)?;
+    let pick = if let [first] = compatible[..] {
         // If only one match, use that
-        compatible.get(0).expect("should not be empty")
+        first
     } else if compatible
         .iter()
         .filter(|provided| provided.sub.is_none())
@@ -1317,46 +1321,104 @@ pub(crate) fn get_image(config: &Config, target: &Target, uses_zig: bool) -> Res
             .expect("should exists at least one non-sub image in list")
     } else {
         // if there's multiple targets and no option can be chosen, bail
-        return Err(eyre::eyre!(
-            "`cross` provides multiple images for target {target_name}, \
+        return Err(GetImageError::MultipleImages(
+            eyre::eyre!(
+                "`cross` provides multiple images for target {target_name}, \
                specify toolchain in `Cross.toml`."
-        )
-        .with_note(|| {
-            format!(
-                "candidates: {}",
-                compatible
-                    .iter()
-                    .map(|provided| format!("\"{}\"", provided.image_name(CROSS_IMAGE, version)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
             )
-        }));
+            .with_note(|| {
+                format!(
+                    "candidates: {}",
+                    compatible
+                        .iter()
+                        .map(|provided| format!("\"{}\"", provided.default_image_name()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }),
+        ));
     };
 
-    let mut image: PossibleImage = pick.image_name(CROSS_IMAGE, version).into();
+    let image_name = pick.default_image_name();
+    if pick.platforms.is_empty() {
+        return Err(GetImageError::SpecifiedImageNoPlatform(image_name));
+    }
 
-    eyre::ensure!(
-        !pick.platforms.is_empty(),
-        "platforms for provided image `{image}` are not specified, this is a bug in cross"
-    );
-
+    let mut image: PossibleImage = image_name.into();
     image.toolchain = pick.platforms.to_vec();
     Ok(image)
+}
+
+fn docker_inspect_self_mountinfo(engine: &Engine, msg_info: &mut MessageInfo) -> Result<String> {
+    if cfg!(not(target_os = "linux")) {
+        eyre::bail!("/proc/self/mountinfo is unavailable when target_os != linux");
+    }
+
+    // The ID for the current Docker container might be in mountinfo,
+    // somewhere in a mount root. Full IDs are 64-char hexadecimal
+    // strings, so the first matching path segment in a mount root
+    // containing /docker/ is likely to be what we're looking for. See:
+    // https://www.kernel.org/doc/Documentation/filesystems/proc.txt
+    // https://community.toradex.com/t/15240/4
+    let mountinfo = file::read("/proc/self/mountinfo")?;
+    let container_id = mountinfo
+        .lines()
+        .filter_map(|s| s.split(' ').nth(3))
+        .filter(|s| s.contains("/docker/"))
+        .flat_map(|s| s.split('/'))
+        .find(|s| s.len() == 64 && s.as_bytes().iter().all(u8::is_ascii_hexdigit))
+        .ok_or_else(|| eyre::eyre!("couldn't find container id in mountinfo"))?;
+
+    engine
+        .subcommand("inspect")
+        .arg(container_id)
+        .run_and_get_stdout(msg_info)
+}
+
+fn docker_inspect_self(engine: &Engine, msg_info: &mut MessageInfo) -> Result<String> {
+    // Try to find the container ID by looking at HOSTNAME, and fallback to
+    // parsing `/proc/self/mountinfo` if HOSTNAME is unset or if there's no
+    // container that matches it (necessary e.g. when the container uses
+    // `--network=host`, which is act's default, see issue #1321).
+    // If `docker inspect` fails with unexpected output, skip the fallback
+    // and fail instantly.
+    if let Ok(hostname) = env::var("HOSTNAME") {
+        let mut command = engine.subcommand("inspect");
+        command.arg(hostname);
+        let out = command.run_and_get_output(msg_info)?;
+
+        if out.status.success() {
+            Ok(out.stdout()?)
+        } else {
+            let val = serde_json::from_slice::<serde_json::Value>(&out.stdout);
+            if let Ok(val) = val {
+                if let Some(array) = val.as_array() {
+                    // `docker inspect` completed but returned an empty array, most
+                    // likely indicating that the hostname isn't a valid container ID.
+                    if array.is_empty() {
+                        msg_info.debug("docker inspect found no containers matching HOSTNAME, retrying using mountinfo")?;
+                        return docker_inspect_self_mountinfo(engine, msg_info);
+                    }
+                }
+            }
+
+            let report = command
+                .status_result(msg_info, out.status, Some(&out))
+                .expect_err("we know the command failed")
+                .to_section_report();
+            Err(report)
+        }
+    } else {
+        msg_info.debug("HOSTNAME environment variable is unset")?;
+        docker_inspect_self_mountinfo(engine, msg_info)
+    }
 }
 
 fn docker_read_mount_paths(
     engine: &Engine,
     msg_info: &mut MessageInfo,
 ) -> Result<Vec<MountDetail>> {
-    let hostname = env::var("HOSTNAME").wrap_err("HOSTNAME environment variable not found")?;
-
-    let mut docker: Command = {
-        let mut command = engine.subcommand("inspect");
-        command.arg(hostname);
-        command
-    };
-
-    let output = docker.run_and_get_stdout(msg_info)?;
+    let output = docker_inspect_self(engine, msg_info)?;
     let info = serde_json::from_str(&output).wrap_err("failed to parse docker inspect output")?;
     dockerinfo_parse_mounts(&info)
 }
@@ -1487,53 +1549,27 @@ pub fn path_hash(path: &Path, count: usize) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use crate::id;
+    use crate::{config::Environment, id};
 
     #[cfg(not(target_os = "windows"))]
     use crate::file::PathExt;
 
     #[test]
     fn test_docker_user_id() {
-        let var = "CROSS_ROOTLESS_CONTAINER_ENGINE";
-        let old = env::var(var);
-        env::remove_var(var);
-
         let rootful = format!("\"engine\" \"--user\" \"{}:{}\"", id::user(), id::group());
         let rootless = "\"engine\"".to_owned();
 
-        let test = |engine, expected| {
+        let test = |noroot, expected| {
             let mut cmd = Command::new("engine");
-            cmd.add_user_id(engine);
+            cmd.add_user_id(noroot);
             assert_eq!(expected, &format!("{cmd:?}"));
         };
-        test(EngineType::Docker, &rootful);
-        test(EngineType::Podman, &rootless);
-        test(EngineType::PodmanRemote, &rootless);
-        test(EngineType::Other, &rootless);
 
-        env::set_var(var, "0");
-        test(EngineType::Docker, &rootful);
-        test(EngineType::Podman, &rootful);
-        test(EngineType::PodmanRemote, &rootful);
-        test(EngineType::Other, &rootful);
-
-        env::set_var(var, "1");
-        test(EngineType::Docker, &rootless);
-        test(EngineType::Podman, &rootless);
-        test(EngineType::PodmanRemote, &rootless);
-        test(EngineType::Other, &rootless);
-
-        env::set_var(var, "auto");
-        test(EngineType::Docker, &rootful);
-        test(EngineType::Podman, &rootless);
-        test(EngineType::PodmanRemote, &rootless);
-        test(EngineType::Other, &rootless);
-
-        match old {
-            Ok(v) => env::set_var(var, v),
-            Err(_) => env::remove_var(var),
-        }
+        test(false, &rootful);
+        test(true, &rootless);
     }
 
     #[test]
@@ -1569,6 +1605,50 @@ mod tests {
             Ok(v) => env::set_var(var, v),
             Err(_) => env::remove_var(var),
         }
+    }
+
+    #[test]
+    fn test_tag_only_image() -> Result<()> {
+        let target: Target = TargetTriple::X86_64UnknownLinuxGnu.into();
+        let test = |map, expected_ver: &str, expected_ver_zig: &str| -> Result<()> {
+            let env = Environment::new(Some(map));
+            let config = Config::new_with(None, env);
+            for (uses_zig, expected_ver) in [(false, expected_ver), (true, expected_ver_zig)] {
+                let expected_image_target = if uses_zig {
+                    "zig"
+                } else {
+                    "x86_64-unknown-linux-gnu"
+                };
+                let expected = format!("ghcr.io/cross-rs/{expected_image_target}{expected_ver}");
+
+                let image = get_image(&config, &target, uses_zig)?;
+                assert_eq!(image.reference.get(), expected);
+                let image_name = get_image_name(&config, &target, uses_zig)?;
+                assert_eq!(image_name, expected);
+            }
+            Ok(())
+        };
+
+        let default_ver = format!(":{DEFAULT_IMAGE_VERSION}");
+        let mut map = HashMap::new();
+        test(map.clone(), &default_ver, &default_ver)?;
+
+        map.insert("CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_IMAGE", "-centos");
+        test(map.clone(), &format!("{default_ver}-centos"), &default_ver)?;
+
+        map.insert("CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_IMAGE", ":edge");
+        test(map.clone(), ":edge", &default_ver)?;
+
+        map.insert(
+            "CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_ZIG_IMAGE",
+            "@sha256:foobar",
+        );
+        test(map.clone(), ":edge", "@sha256:foobar")?;
+
+        map.remove("CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_IMAGE");
+        test(map.clone(), &default_ver, "@sha256:foobar")?;
+
+        Ok(())
     }
 
     mod directories {
@@ -1695,9 +1775,8 @@ mod tests {
 
             let mut msg_info = MessageInfo::default();
             let engine = create_engine(&mut msg_info);
-            let hostname = env::var("HOSTNAME");
-            if engine.is_err() || hostname.is_err() {
-                eprintln!("could not get container engine or no hostname found");
+            if engine.is_err() {
+                eprintln!("could not get container engine");
                 reset_env(vars);
                 return Ok(());
             }
@@ -1707,12 +1786,8 @@ mod tests {
                 reset_env(vars);
                 return Ok(());
             }
-            let hostname = hostname.unwrap();
-            let output = engine
-                .subcommand("inspect")
-                .arg(hostname)
-                .run_and_get_output(&mut msg_info)?;
-            if !output.status.success() {
+            let output = docker_inspect_self(&engine, &mut msg_info);
+            if output.is_err() {
                 eprintln!("inspect failed");
                 reset_env(vars);
                 return Ok(());
@@ -1728,15 +1803,9 @@ mod tests {
 
             paths_equal(toolchain_dirs.cargo(), &mount_path(home()?.join(".cargo")))?;
             paths_equal(toolchain_dirs.xargo(), &mount_path(home()?.join(".xargo")))?;
-            paths_equal(package_dirs.host_root(), &mount_path(get_cwd()?))?;
-            assert_eq!(
-                package_dirs.mount_root(),
-                &mount_path(get_cwd()?).as_posix_absolute()?
-            );
-            assert_eq!(
-                package_dirs.mount_cwd(),
-                &mount_path(get_cwd()?).as_posix_absolute()?
-            );
+            paths_equal(package_dirs.host_root(), &get_cwd()?)?;
+            assert_eq!(package_dirs.mount_root(), &get_cwd()?.as_posix_absolute()?);
+            assert_eq!(package_dirs.mount_cwd(), &get_cwd()?.as_posix_absolute()?);
 
             reset_env(vars);
             Ok(())

@@ -1,5 +1,16 @@
 on:
+  workflow_call:
+    inputs:
+      matrix-args:
+        required: false
+        type: string
+        description: Arguments to pass to `cargo xtask ci-job target-matrix`
+      checkout-ref:
+        required: false
+        type: string
+        description: Used to checkout a specific ref, instead of the default ref with `actions/checkout` action
   pull_request:
+  merge_group:
   push:
     branches: [main, staging, trying]
     tags:
@@ -16,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
 
       - name: Run ShellCheck
         uses: azohra/shell-linter@v0.6.0
@@ -24,12 +37,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
+      with:
+        ref: ${{ inputs.checkout-ref }}
     - uses: EmbarkStudios/cargo-deny-action@v1
 
   fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -48,11 +65,13 @@ jobs:
           - windows-latest
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
 
       - uses: ./.github/actions/setup-rust
         with:
           components: clippy
-          toolchain: 1.64.0 # MSRV, Minimally Supported Rust Version. Make sure to update README.md
+          toolchain: 1.77.2 # MSRV, Minimally Supported Rust Version. Make sure to update README.md and clippy.toml
       - name: Run clippy
         run: cargo clippy --locked --all-targets --all-features --workspace -- -D warnings
   test:
@@ -65,6 +84,8 @@ jobs:
           - windows-latest
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
 
       - uses: ./.github/actions/setup-rust
       - uses: ./.github/actions/cargo-llvm-cov
@@ -80,6 +101,8 @@ jobs:
       is-latest: ${{ steps.check.outputs.is-latest }}
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
       - uses: ./.github/actions/setup-rust
       - run: cargo xtask ci-job check
         id: check
@@ -87,23 +110,27 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.generate-matrix.outputs.matrix }}
+      tests: ${{ steps.generate-matrix.outputs.tests }}
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
       - uses: ./.github/actions/setup-rust
 
       - name: Generate matrix
         id: generate-matrix
-        run: cargo xtask ci-job target-matrix
+        run: cargo xtask ci-job target-matrix ${{ github.event_name == 'merge_group' && format('--merge-group {0}', github.ref) || '' }} ${{ inputs.matrix-args || '' }}
         env:
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-          COMMIT_AUTHOR: ${{ github.event.head_commit.author.username }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     name: target (${{ matrix.pretty }},${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: [shellcheck, test, generate-matrix, check]
-    if: github.event_name == 'push' && needs.generate-matrix.outputs.matrix != '{}' && needs.generate-matrix.outputs.matrix != '[]' && needs.generate-matrix.outputs.matrix != ''
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || github.event_name == 'issue_comment' || github.event_name == 'schedule')  && needs.generate-matrix.outputs.matrix != '{}' && needs.generate-matrix.outputs.matrix != '[]' && needs.generate-matrix.outputs.matrix != ''
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.pretty }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -114,6 +141,8 @@ jobs:
       coverage-artifact: ${{ steps.cov.outputs.artifact-name }}
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
 
       - uses: ./.github/actions/setup-rust
 
@@ -157,7 +186,7 @@ jobs:
         id: build-docker-image
         if: steps.prepare-meta.outputs.has-image
         timeout-minutes: 120
-        run: cargo xtask build-docker-image -v "${TARGET}${SUB:+.$SUB}"
+        run: cargo xtask build-docker-image -v "${TARGET}${SUB:+.$SUB}" ${{ matrix.verbose && '-v' || ''  }}
         env:
           TARGET: ${{ matrix.target }}
           SUB: ${{ matrix.sub }}
@@ -212,6 +241,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push image to GitHub Container Registry
         if: >
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') &&
           steps.prepare-meta.outputs.has-image && (
             github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
             startsWith(github.ref, 'refs/tags/v')
@@ -226,11 +256,13 @@ jobs:
 
   # we should always have an artifact from a previous build.
   remote:
-    needs: [test, check]
+    needs: [test, check, generate-matrix]
+    if: fromJson(needs.generate-matrix.outputs.tests).remote
     runs-on: ubuntu-latest
-    if: github.actor == 'bors[bot]'
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
       - uses: ./.github/actions/setup-rust
 
       - name: LLVM instrument coverage
@@ -245,11 +277,13 @@ jobs:
         shell: bash
 
   bisect:
-    needs: [test, check]
+    needs: [test, check, generate-matrix]
+    if: fromJson(needs.generate-matrix.outputs.tests).bisect
     runs-on: ubuntu-latest
-    if: github.actor == 'bors[bot]'
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
       - uses: ./.github/actions/setup-rust
 
       - name: LLVM instrument coverage
@@ -264,11 +298,13 @@ jobs:
         shell: bash
 
   foreign:
-    needs: [test, check]
+    needs: [test, check, generate-matrix]
+    if: fromJson(needs.generate-matrix.outputs.tests).foreign
     runs-on: ubuntu-latest
-    if: github.actor == 'bors[bot]'
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
       - uses: ./.github/actions/setup-rust
 
       - name: LLVM instrument coverage
@@ -289,11 +325,13 @@ jobs:
         shell: bash
 
   docker-in-docker:
-    needs: [test, check]
+    needs: [test, check, generate-matrix]
+    if: fromJson(needs.generate-matrix.outputs.tests).docker-in-docker
     runs-on: ubuntu-latest
-    if: github.actor == 'bors[bot]'
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
       - uses: ./.github/actions/setup-rust
 
       - name: LLVM instrument coverage
@@ -311,16 +349,16 @@ jobs:
   podman:
     name: podman
     runs-on: ubuntu-latest
-    needs: [shellcheck, test, check]
-    if: github.event_name == 'push'
+    needs: [shellcheck, test, check, generate-matrix]
+    if: fromJson(needs.generate-matrix.outputs.tests).podman
     strategy:
       fail-fast: false
     outputs:
-      has-image: ${{ steps.prepare-meta.outputs.has-image }}
-      images: ${{ steps.build-docker-image.outputs.images && fromJSON(steps.build-docker-image.outputs.images)  }}
       coverage-artifact: ${{ steps.cov.outputs.artifact-name }}
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
 
       - uses: ./.github/actions/setup-rust
 
@@ -352,6 +390,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
       - uses: ./.github/actions/setup-rust
       - uses: ./.github/actions/cargo-publish
         with:
@@ -380,8 +420,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.checkout-ref }}
       - uses: ./.github/actions/setup-rust
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/artifacts
       - name: Grab PR number
@@ -407,5 +449,5 @@ jobs:
             ./codecov -F $name ${pr:+-P ${pr}} -f $file --sha ${sha_rev} -n $name;
           done
         env:
-          pr: ${{  steps.pr-number.outputs.pr || '' }}
+          pr: ${{  steps.pr-number.outputs.pr }}
           artifacts: ${{ runner.temp }}/artifacts

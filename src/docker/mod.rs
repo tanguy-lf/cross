@@ -12,7 +12,9 @@ pub use self::engine::*;
 pub use self::provided_images::PROVIDED_IMAGES;
 pub use self::shared::*;
 
-pub use image::{Architecture, Image, ImagePlatform, Os as ContainerOs, PossibleImage};
+pub use image::{
+    Architecture, Image, ImagePlatform, ImageReference, Os as ContainerOs, PossibleImage,
+};
 
 use std::process::ExitStatus;
 
@@ -31,6 +33,10 @@ impl ProvidedImage {
     pub fn image_name(&self, repository: &str, tag: &str) -> String {
         image_name(self.name, self.sub, repository, tag)
     }
+
+    pub fn default_image_name(&self) -> String {
+        self.image_name(CROSS_IMAGE, DEFAULT_IMAGE_VERSION)
+    }
 }
 
 pub fn image_name(target: &str, sub: Option<&str>, repository: &str, tag: &str) -> String {
@@ -41,13 +47,16 @@ pub fn image_name(target: &str, sub: Option<&str>, repository: &str, tag: &str) 
     }
 }
 
+// TODO: The Option here in the result should be removed and Result::Error replaced with a enum to properly signal error
+
+// Ok(None) means that the command failed, due to a warning or error, when `msg_info.should_fail() == true`
 pub fn run(
     options: DockerOptions,
     paths: DockerPaths,
     args: &[String],
     subcommand: Option<crate::Subcommand>,
     msg_info: &mut MessageInfo,
-) -> Result<ExitStatus> {
+) -> Result<Option<ExitStatus>> {
     if cfg!(target_os = "windows") && options.in_docker() {
         msg_info.fatal(
             "running cross insider a container running windows is currently unsupported",

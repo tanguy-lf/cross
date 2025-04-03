@@ -4,11 +4,17 @@ set -x
 set -euo pipefail
 
 # shellcheck disable=SC1091
-. lib.sh
+. /lib.sh
 # shellcheck disable=SC1091
-. freebsd-common.sh
+. /freebsd-common.sh
 # shellcheck disable=SC1091
-. freebsd-install.sh
+. /freebsd-install.sh
+
+case "${FREEBSD_ARCH}" in
+    arm64) # extras mirrors are under https://pkg.freebsd.org/
+        FREEBSD_ARCH=aarch64 #  https://pkg.freebsd.org/FreeBSD:13:aarch64/
+        ;;
+esac
 
 main() {
     apt-get update && apt-get install --assume-yes --no-install-recommends \

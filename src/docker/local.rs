@@ -31,12 +31,12 @@ pub(crate) fn run(
     paths: DockerPaths,
     args: &[String],
     msg_info: &mut MessageInfo,
-) -> Result<ExitStatus> {
+) -> Result<Option<ExitStatus>> {
     let engine = &options.engine;
     let toolchain_dirs = paths.directories.toolchain_directories();
     let package_dirs = paths.directories.package_directories();
 
-    let mut cmd = options.cargo_variant.safe_command();
+    let mut cmd = options.command_variant.safe_command();
     cmd.args(args);
 
     let mut docker = engine.subcommand("run");
@@ -73,7 +73,7 @@ pub(crate) fn run(
     docker
         .add_seccomp(engine.kind, &options.target, &paths.metadata)
         .wrap_err("when copying seccomp profile")?;
-    docker.add_user_id(engine.kind);
+    docker.add_user_id(engine.is_rootless);
 
     docker
         .args([
@@ -95,20 +95,25 @@ pub(crate) fn run(
         // Prevent `bin` from being mounted inside the Docker container.
         .args(["-v", &format!("{}/bin", toolchain_dirs.cargo_mount_path())]);
 
+    let host_root = paths.mount_finder.find_mount_path(package_dirs.host_root());
     docker.args([
         "-v",
         &format!(
             "{}:{}{selinux}",
-            package_dirs.host_root().to_utf8()?,
+            host_root.to_utf8()?,
             package_dirs.mount_root()
         ),
     ]);
+
+    let sysroot = paths
+        .mount_finder
+        .find_mount_path(toolchain_dirs.get_sysroot());
     docker
         .args([
             "-v",
             &format!(
                 "{}:{}{selinux_ro}",
-                toolchain_dirs.get_sysroot().to_utf8()?,
+                sysroot.to_utf8()?,
                 toolchain_dirs.sysroot_mount_path()
             ),
         ])
@@ -134,6 +139,11 @@ pub(crate) fn run(
     if io::Stdin::is_atty() && io::Stdout::is_atty() && io::Stderr::is_atty() {
         docker.arg("-t");
     }
+
+    if options.interactive {
+        docker.arg("-i");
+    }
+
     let mut image_name = options.image.name.clone();
     if options.needs_custom_image() {
         image_name = options
@@ -142,11 +152,13 @@ pub(crate) fn run(
     }
 
     ChildContainer::create(engine.clone(), container_id)?;
+    if msg_info.should_fail() {
+        return Ok(None);
+    }
     let status = docker
         .arg(&image_name)
         .add_build_command(toolchain_dirs, &cmd)
-        .run_and_get_status(msg_info, false)
-        .map_err(Into::into);
+        .run_and_get_status(msg_info, false);
 
     // `cargo` generally returns 0 or 101 on completion, but isn't guaranteed
     // to. `ExitStatus::code()` may be None if a signal caused the process to
@@ -158,5 +170,5 @@ pub(crate) fn run(
         ChildContainer::exit_static();
     }
 
-    status
+    status.map(Some)
 }

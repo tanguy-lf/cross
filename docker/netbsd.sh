@@ -38,8 +38,9 @@ main() {
     sed -i -e 's/ftp:/https:/g' ./contrib/download_prerequisites
     ./contrib/download_prerequisites
     local patches=(
-        https://ftp.netbsd.org/pub/pkgsrc/current/pkgsrc/lang/gcc9/patches/patch-libstdc++-v3_config_os_bsd_netbsd_ctype__base.h
         https://ftp.netbsd.org/pub/pkgsrc/current/pkgsrc/lang/gcc9/patches/patch-libstdc++-v3_config_os_bsd_netbsd_ctype__configure__char.cc
+        https://ftp.netbsd.org/pub/pkgsrc/current/pkgsrc/lang/gcc9/patches/patch-libstdc++-v3_config_os_bsd_netbsd_ctype__base.h
+        https://ftp.netbsd.org/pub/pkgsrc/current/pkgsrc/lang/gcc8/patches/patch-libgfortran_io_io.h
     )
 
     local patch
@@ -78,6 +79,7 @@ main() {
     cp "${td}/netbsd/lib/libpthread.so.1.4" "${destdir}/lib"
     cp "${td}/netbsd/usr/lib/librt.so.1.1" "${destdir}/lib"
     cp "${td}/netbsd/usr/lib"/lib{c,m,pthread}{,_p}.a "${destdir}/lib"
+    cp "${td}/netbsd/usr/lib"/libexecinfo.so "${destdir}/lib"
     cp "${td}/netbsd/usr/lib"/{crt0,crti,crtn,crtbeginS,crtendS,crtbegin,crtend,gcrt0}.o "${destdir}/lib"
 
     ln -s libc.so.12.213 "${destdir}/lib/libc.so"
@@ -91,7 +93,8 @@ main() {
     ln -s libutil.so.7.24 "${destdir}/lib/libutil.so.7"
 
     pushd gcc-build
-    ../gcc/configure \
+    # remove the environment variables after bumping the gcc version to 11.
+    target_configargs="ac_cv_func_newlocale=no ac_cv_func_freelocale=no ac_cv_func_uselocale=no" ../gcc/configure \
         --disable-libada \
         --disable-libcilkrt \
         --disable-libcilkrts \
@@ -104,7 +107,7 @@ main() {
         --disable-lto \
         --disable-multilib \
         --disable-nls \
-        --enable-languages=c,c++ \
+        --enable-languages=c,c++,fortran \
         --target="${target}"
     make "-j$(nproc)"
     make install

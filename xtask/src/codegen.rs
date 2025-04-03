@@ -1,15 +1,12 @@
 use clap::Args;
+use cross::docker::ImagePlatform;
 use eyre::Context;
 use std::fmt::Write;
 
 use crate::util::{get_cargo_workspace, get_matrix};
 
 #[derive(Args, Debug)]
-pub struct Codegen {
-    /// Provide verbose diagnostic output.
-    #[clap(short, long)]
-    verbose: bool,
-}
+pub struct Codegen {}
 
 pub fn codegen(Codegen { .. }: Codegen) -> cross::Result<()> {
     let path = get_cargo_workspace().join("src/docker/provided_images.rs");
@@ -19,16 +16,16 @@ pub fn codegen(Codegen { .. }: Codegen) -> cross::Result<()> {
 
 pub fn docker_images() -> String {
     let mut images = String::from(
-        r##"#![doc = "*** AUTO-GENERATED, do not touch. Run `cargo xtask codegen` to update ***"]
+        r#"#![doc = "*** AUTO-GENERATED, do not touch. Run `cargo xtask codegen` to update ***"]
 use super::{ImagePlatform, ProvidedImage};
 
 #[rustfmt::skip]
-pub static PROVIDED_IMAGES: &[ProvidedImage] = &["##,
+pub static PROVIDED_IMAGES: &[ProvidedImage] = &["#,
     );
 
     for image_target in get_matrix()
         .iter()
-        .filter(|i| i.builds_image() && i.to_image_target().is_toolchain_image())
+        .filter(|i| i.builds_image() && i.to_image_target().is_toolchain_image() && !i.disabled)
     {
         write!(
             &mut images,
@@ -43,10 +40,12 @@ pub static PROVIDED_IMAGES: &[ProvidedImage] = &["##,
                 .platforms()
                 .iter()
                 .map(|p| {
-                    format!(
-                        "ImagePlatform::{}",
-                        p.replace('-', "_").to_ascii_uppercase()
-                    )
+                    let image_platform: ImagePlatform =
+                        p.parse().expect("should be a valid platform");
+
+                    image_platform
+                        .to_codegen_string()
+                        .expect("should be a valid platform")
                 })
                 .collect::<Vec<_>>()
                 .join(", "),

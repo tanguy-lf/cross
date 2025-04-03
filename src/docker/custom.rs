@@ -7,7 +7,10 @@ use crate::shell::MessageInfo;
 use crate::{errors::*, file, CommandExt, ToUtf8};
 use crate::{CargoMetadata, TargetTriple};
 
-use super::{get_image_name, path_hash, BuildCommandExt, BuildResultExt, Engine, ImagePlatform};
+use super::{
+    create_target_dir, get_image_name, path_hash, BuildCommandExt, BuildResultExt, Engine,
+    ImagePlatform,
+};
 
 pub const CROSS_CUSTOM_DOCKERFILE_IMAGE_PREFIX: &str = "localhost/cross-rs/cross-custom-";
 
@@ -85,7 +88,7 @@ impl<'a> Dockerfile<'a> {
         build_args: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
         msg_info: &mut MessageInfo,
     ) -> Result<String> {
-        let uses_zig = options.cargo_variant.uses_zig();
+        let uses_zig = options.command_variant.uses_zig();
         let mut docker_build = options.engine.command();
         docker_build.invoke_build_command();
         docker_build.disable_scan_suggest();
@@ -117,13 +120,16 @@ impl<'a> Dockerfile<'a> {
         }
 
         let path = match self {
-            Dockerfile::File { path, .. } => PathBuf::from(path),
+            Dockerfile::File { path, .. } => {
+                paths.metadata.workspace_root.join(PathBuf::from(path))
+            }
             Dockerfile::Custom { content, .. } => {
-                let path = paths
+                let target_dir = paths
                     .metadata
                     .target_directory
-                    .join(options.target.to_string())
-                    .join(format!("Dockerfile.{}-custom", &options.target));
+                    .join(options.target.to_string());
+                create_target_dir(&target_dir)?;
+                let path = target_dir.join(format!("Dockerfile.{}-custom", &options.target));
                 {
                     let mut file = file::write_file(&path, true)?;
                     file.write_all(content.as_bytes())?;
@@ -143,10 +149,6 @@ impl<'a> Dockerfile<'a> {
             }
         }
 
-        // note that this is always relative to the PWD: if we have
-        // `$workspace_root/Dockerfile`, then running a build
-        // `PWD=$workspace_root/src/ cross build` would require
-        //  the Dockerfile path to be specified as `../Dockerfile`.
         docker_build.args(["--file".into(), path]);
 
         if let Some(build_opts) = options.config.build_opts() {

@@ -17,8 +17,8 @@ silence_stdout() {
 main() {
     local config="${1}"
     local nproc="${2}"
-    local ctng_version=1.24.0
-    local ctng_url="https://ci-mirrors.rust-lang.org/rustc/crosstool-ng-${ctng_version}.tar.gz"
+    local ctng_version=${3:-crosstool-ng-1.27.0}
+    local ctng_url="https://github.com/crosstool-ng/crosstool-ng"
     local username=crosstool
     local crosstooldir=/opt/crosstool
     local buildir
@@ -39,6 +39,7 @@ main() {
         python3 \
         python3-dev \
         python3-pip \
+        rsync \
         texinfo \
         wget \
         unzip \
@@ -50,8 +51,11 @@ main() {
 
     pushd "${td}"
 
-    curl --retry 3 -sSfL "${ctng_url}" | tar xzf -
-    pushd "crosstool-ng-crosstool-ng-${ctng_version}"
+    mkdir "crosstool-ng-${ctng_version}"
+    pushd "crosstool-ng-${ctng_version}"
+    git init
+    git fetch --depth=1 "${ctng_url}" "${ctng_version}"
+    git reset --hard FETCH_HEAD
     ./bootstrap
     ./configure --prefix="${crosstooldir}"
     make -j"${nproc}"
@@ -70,6 +74,7 @@ main() {
     pushd "${buildir}"
     cp /"${config}" .config
     chown "${username}":"${username}" .config
+    su "${username}" -c "${crosstooldir}/bin/ct-ng olddefconfig"
 
     # the download steps can stall indefinitely, so we want to set a timeout to
     # ensure it always completes. we therefore attempt to  download until

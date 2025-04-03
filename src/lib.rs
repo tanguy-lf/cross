@@ -8,7 +8,8 @@
 //! <strong>⚠️ Warning:</strong> The cross library is for internal
 //! use only: only the command-line interface is stable. The library
 //! may change at any point for any reason. For documentation on the
-//! CLI, please see the repository <a href="https://github.com/cross-rs/cross">README</a>
+//! CLI, please see the repository <a href="https://github.com/cross-rs/cross">README</a>,
+//! <a href="https://github.com/cross-rs/cross/tree/main/docs">docs folder</a>
 //! or the <a href="https://github.com/cross-rs/cross/wiki">wiki</a>.
 //! </p>
 
@@ -33,7 +34,7 @@ mod tests;
 pub mod cargo;
 pub mod cli;
 pub mod config;
-mod cross_toml;
+pub mod cross_toml;
 pub mod docker;
 pub mod errors;
 mod extensions;
@@ -53,6 +54,7 @@ use cli::Args;
 use color_eyre::owo_colors::OwoColorize;
 use color_eyre::{Help, SectionExt};
 use config::Config;
+use cross_toml::BuildStd;
 use rustc::{QualifiedToolchain, Toolchain};
 use rustc_version::Channel;
 use serde::{Deserialize, Serialize, Serializer};
@@ -63,7 +65,7 @@ use self::errors::Context;
 use self::shell::{MessageInfo, Verbosity};
 
 pub use self::errors::{install_panic_hook, install_termination_hook, Result};
-pub use self::extensions::{CommandExt, OutputExt};
+pub use self::extensions::{CommandExt, OutputExt, SafeCommand};
 pub use self::file::{pretty_path, ToUtf8};
 pub use self::rustc::{TargetList, VersionMetaExt};
 
@@ -155,9 +157,10 @@ impl TargetTriple {
             "x86_64-unknown-dragonfly" => Some("dragonflybsd-amd64"),
             "i686-unknown-freebsd" => Some("freebsd-i386"),
             "x86_64-unknown-freebsd" => Some("freebsd-amd64"),
+            "aarch64-unknown-freebsd" => Some("freebsd-arm64"),
             "x86_64-unknown-netbsd" => Some("netbsd-amd64"),
             "sparcv9-sun-solaris" => Some("solaris-sparc"),
-            "x86_64-sun-solaris" => Some("solaris-amd64"),
+            "x86_64-pc-solaris" => Some("solaris-amd64"),
             "thumbv6m-none-eabi" => Some("arm"),
             "thumbv7em-none-eabi" => Some("arm"),
             "thumbv7em-none-eabihf" => Some("armhf"),
@@ -443,36 +446,42 @@ impl Serialize for Target {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CargoVariant {
+pub enum CommandVariant {
     Cargo,
     Xargo,
     Zig,
+    Shell,
 }
 
-impl CargoVariant {
-    pub fn create(uses_zig: bool, uses_xargo: bool) -> Result<CargoVariant> {
+impl CommandVariant {
+    pub fn create(uses_zig: bool, uses_xargo: bool) -> Result<CommandVariant> {
         match (uses_zig, uses_xargo) {
             (true, true) => eyre::bail!("cannot use both zig and xargo"),
-            (true, false) => Ok(CargoVariant::Zig),
-            (false, true) => Ok(CargoVariant::Xargo),
-            (false, false) => Ok(CargoVariant::Cargo),
+            (true, false) => Ok(CommandVariant::Zig),
+            (false, true) => Ok(CommandVariant::Xargo),
+            (false, false) => Ok(CommandVariant::Cargo),
         }
     }
 
     pub fn to_str(self) -> &'static str {
         match self {
-            CargoVariant::Cargo => "cargo",
-            CargoVariant::Xargo => "xargo",
-            CargoVariant::Zig => "cargo-zigbuild",
+            CommandVariant::Cargo => "cargo",
+            CommandVariant::Xargo => "xargo",
+            CommandVariant::Zig => "cargo-zigbuild",
+            CommandVariant::Shell => "sh",
         }
     }
 
     pub fn uses_xargo(self) -> bool {
-        self == CargoVariant::Xargo
+        self == CommandVariant::Xargo
     }
 
     pub fn uses_zig(self) -> bool {
-        self == CargoVariant::Zig
+        self == CommandVariant::Zig
+    }
+
+    pub(crate) fn is_shell(self) -> bool {
+        self == CommandVariant::Shell
     }
 }
 
@@ -517,6 +526,13 @@ pub fn run(
         ))?;
     }
 
+    if let Some(Subcommand::Other(command)) = &args.subcommand {
+        msg_info.warn(format_args!(
+            "specified cargo subcommand `{command}` is not supported by `cross`."
+        ))?;
+        return Ok(None);
+    }
+
     let host_version_meta = rustc::version_meta()?;
 
     let cwd = std::env::current_dir()?;
@@ -526,7 +542,7 @@ pub fn run(
             target,
             uses_xargo,
             uses_zig,
-            uses_build_std,
+            build_std,
             zig_version,
             toolchain,
             is_remote,
@@ -571,7 +587,7 @@ pub fn run(
             rustup::setup_components(
                 &target,
                 uses_xargo,
-                uses_build_std,
+                build_std.enabled(),
                 &toolchain,
                 is_nightly,
                 available_targets,
@@ -579,17 +595,12 @@ pub fn run(
                 msg_info,
             )?;
 
-            let filtered_args = get_filtered_args(
-                zig_version,
-                &args,
-                &target,
-                &config,
-                is_nightly,
-                uses_build_std,
-            );
+            let filtered_args =
+                get_filtered_args(zig_version, &args, &target, &config, is_nightly, &build_std);
 
             let needs_docker = args
                 .subcommand
+                .clone()
                 .map_or(false, |sc| sc.needs_docker(is_remote));
             if target.needs_docker() && needs_docker {
                 let paths = docker::DockerPaths::create(
@@ -604,9 +615,14 @@ pub fn run(
                     target.clone(),
                     config,
                     image,
-                    crate::CargoVariant::create(uses_zig, uses_xargo)?,
+                    crate::CommandVariant::create(uses_zig, uses_xargo)?,
                     rustc_version,
+                    false,
                 );
+
+                if msg_info.should_fail() {
+                    return Ok(None);
+                }
 
                 install_interpreter_if_needed(
                     &args,
@@ -615,9 +631,20 @@ pub fn run(
                     &options,
                     msg_info,
                 )?;
+                let status = if let Some(status) = docker::run(
+                    options,
+                    paths,
+                    &filtered_args,
+                    args.subcommand.clone(),
+                    msg_info,
+                )
+                .wrap_err("could not run container")?
+                {
+                    status
+                } else {
+                    return Ok(None);
+                };
 
-                let status = docker::run(options, paths, &filtered_args, args.subcommand, msg_info)
-                    .wrap_err("could not run container")?;
                 let needs_host = args.subcommand.map_or(false, |sc| sc.needs_host(is_remote));
                 if !status.success() {
                     warn_on_failure(&target, &toolchain, msg_info)?;
@@ -639,7 +666,10 @@ pub fn install_interpreter_if_needed(
     options: &docker::DockerOptions,
     msg_info: &mut MessageInfo,
 ) -> Result<(), color_eyre::Report> {
-    let needs_interpreter = args.subcommand.map_or(false, |sc| sc.needs_interpreter());
+    let needs_interpreter = args
+        .subcommand
+        .clone()
+        .map_or(false, |sc| sc.needs_interpreter());
 
     if host_version_meta.needs_interpreter()
         && needs_interpreter
@@ -658,11 +688,12 @@ pub fn get_filtered_args(
     target: &Target,
     config: &Config,
     is_nightly: bool,
-    uses_build_std: bool,
+    build_std: &BuildStd,
 ) -> Vec<String> {
     let add_libc = |triple: &str| add_libc_version(triple, zig_version.as_deref());
     let mut filtered_args = if args
         .subcommand
+        .clone()
         .map_or(false, |s| !s.needs_target_in_command())
     {
         let mut filtered_args = Vec::new();
@@ -703,13 +734,23 @@ pub fn get_filtered_args(
         args.cargo_args.clone()
     };
 
-    let is_test = args.subcommand.map_or(false, |sc| sc == Subcommand::Test);
+    let is_test = args
+        .subcommand
+        .clone()
+        .map_or(false, |sc| sc == Subcommand::Test);
     if is_test && config.doctests().unwrap_or_default() && is_nightly {
         filtered_args.push("-Zdoctest-xcompile".to_owned());
     }
-    if uses_build_std {
-        filtered_args.push("-Zbuild-std".to_owned());
+
+    if build_std.enabled() {
+        let mut arg = "-Zbuild-std".to_owned();
+        if let BuildStd::Crates(crates) = build_std {
+            arg.push('=');
+            arg.push_str(&crates.join(","));
+        }
+        filtered_args.push(arg);
     }
+
     filtered_args.extend(args.rest_args.iter().cloned());
     filtered_args
 }
@@ -724,18 +765,23 @@ pub fn setup(
 ) -> Result<Option<CrossSetup>, color_eyre::Report> {
     let host = host_version_meta.host();
     let toml = toml(metadata, msg_info)?;
-    let config = Config::new(toml);
+    let config = Config::new(Some(toml));
     let target = args
         .target
         .clone()
         .or_else(|| config.target(&target_list))
         .unwrap_or_else(|| Target::from(host.triple(), &target_list));
-    let uses_build_std = config.build_std(&target).unwrap_or(false);
-    let uses_xargo = !uses_build_std && config.xargo(&target).unwrap_or(!target.is_builtin());
+    let build_std = config.build_std(&target).unwrap_or_default();
+    let uses_xargo = !build_std.enabled() && config.xargo(&target).unwrap_or(!target.is_builtin());
     let uses_zig = config.zig(&target).unwrap_or(false);
-    let zig_version = config.zig_version(&target)?;
+    let zig_version = config.zig_version(&target);
     let image = match docker::get_image(&config, &target, uses_zig) {
         Ok(i) => i,
+        Err(docker::GetImageError::NoCompatibleImages(..))
+            if config.dockerfile(&target).is_some() =>
+        {
+            "scratch".into()
+        }
         Err(err) => {
             msg_info.warn(err)?;
 
@@ -764,14 +810,14 @@ To override the toolchain mounted in the image, set `target.{target}.image.toolc
     };
     let is_remote = docker::Engine::is_remote();
     let engine = docker::Engine::new(None, Some(is_remote), msg_info)?;
-    let image = image.to_definite_with(&engine, msg_info);
+    let image = image.to_definite_with(&engine, msg_info)?;
     toolchain.replace_host(&image.platform);
     Ok(Some(CrossSetup {
         config,
         target,
         uses_xargo,
         uses_zig,
-        uses_build_std,
+        build_std,
         zig_version,
         toolchain,
         is_remote,
@@ -786,7 +832,7 @@ pub struct CrossSetup {
     pub target: Target,
     pub uses_xargo: bool,
     pub uses_zig: bool,
-    pub uses_build_std: bool,
+    pub build_std: BuildStd,
     pub zig_version: Option<String>,
     pub toolchain: QualifiedToolchain,
     pub is_remote: bool,
@@ -824,19 +870,19 @@ pub(crate) fn warn_host_version_mismatch(
         );
         if versions.is_lt() || (versions.is_eq() && dates.is_lt()) {
             if cfg!(not(test)) {
-                msg_info.warn(format_args!("using older {rustc_warning}.\n > Update with `rustup update --force-non-host {toolchain}`"))?;
+                msg_info.info(format_args!("using older {rustc_warning}.\n > Update with `rustup update --force-non-host {toolchain}`"))?;
             }
             return Ok(VersionMatch::OlderTarget);
         } else if versions.is_gt() || (versions.is_eq() && dates.is_gt()) {
             if cfg!(not(test)) {
-                msg_info.warn(format_args!(
+                msg_info.info(format_args!(
                     "using newer {rustc_warning}.\n > Update with `rustup update`"
                 ))?;
             }
             return Ok(VersionMatch::NewerTarget);
         } else {
             if cfg!(not(test)) {
-                msg_info.warn(format_args!("using {rustc_warning}."))?;
+                msg_info.info(format_args!("using {rustc_warning}."))?;
             }
             return Ok(VersionMatch::Different);
         }
@@ -860,39 +906,79 @@ macro_rules! commit_info {
 /// These locations are checked in the following order:
 /// 1. If the `CROSS_CONFIG` variable is set, it tries to read the config from its value
 /// 2. Otherwise, the `Cross.toml` in the project root is used
-/// 3. Package metadata in the Cargo.toml
+/// 3. Package and workspace metadata in the Cargo.toml
 ///
-/// The values from `CROSS_CONFIG` or `Cross.toml` are concatenated with the package
+/// The values from `CROSS_CONFIG` or `Cross.toml` are concatenated with the
 /// metadata in `Cargo.toml`, with `Cross.toml` having the highest priority.
-fn toml(metadata: &CargoMetadata, msg_info: &mut MessageInfo) -> Result<Option<CrossToml>> {
+pub fn toml(metadata: &CargoMetadata, msg_info: &mut MessageInfo) -> Result<CrossToml> {
     let root = &metadata.workspace_root;
     let cross_config_path = match env::var("CROSS_CONFIG") {
         Ok(var) => PathBuf::from(var),
         Err(_) => root.join("Cross.toml"),
     };
 
-    // Attempts to read the cross config from the Cargo.toml
-    let cargo_toml_str =
-        file::read(root.join("Cargo.toml")).wrap_err("failed to read Cargo.toml")?;
-
-    if cross_config_path.exists() {
+    let mut config = if cross_config_path.exists() {
         let cross_toml_str = file::read(&cross_config_path)
             .wrap_err_with(|| format!("could not read file `{cross_config_path:?}`"))?;
 
-        let (config, _) = CrossToml::parse(&cargo_toml_str, &cross_toml_str, msg_info)
-            .wrap_err_with(|| format!("failed to parse file `{cross_config_path:?}` as TOML",))?;
+        let (config, _) = CrossToml::parse_from_cross_str(
+            &cross_toml_str,
+            Some(cross_config_path.to_utf8()?),
+            msg_info,
+        )
+        .wrap_err_with(|| format!("failed to parse file `{cross_config_path:?}` as TOML",))?;
 
-        Ok(Some(config))
+        config
     } else {
         // Checks if there is a lowercase version of this file
         if root.join("cross.toml").exists() {
             msg_info.warn("There's a file named cross.toml, instead of Cross.toml. You may want to rename it, or it won't be considered.")?;
         }
+        CrossToml::default()
+    };
+    let mut found: Option<std::borrow::Cow<'_, str>> = None;
 
-        if let Some((cfg, _)) = CrossToml::parse_from_cargo(&cargo_toml_str, msg_info)? {
-            Ok(Some(cfg))
-        } else {
-            Ok(None)
+    if let Some(workspace_metadata) = &metadata.metadata {
+        let workspace_metadata =
+            serde_json::de::from_str::<serde_json::Value>(workspace_metadata.get())?;
+        if let Some(cross) = workspace_metadata.get("cross") {
+            found = Some(
+                metadata
+                    .workspace_root
+                    .join("Cargo.toml")
+                    .to_utf8()?
+                    .to_owned()
+                    .into(),
+            );
+            let (workspace_config, _) =
+                CrossToml::parse_from_deserializer(cross, found.as_deref(), msg_info)?;
+            config = config.merge(workspace_config)?;
         }
     }
+
+    for (package, package_metadata) in metadata
+        .packages
+        .iter()
+        .filter(|p| metadata.workspace_members.contains(&p.id))
+        .filter_map(|p| Some((p.manifest_path.as_path(), p.metadata.as_deref()?)))
+    {
+        let package_metadata =
+            serde_json::de::from_str::<serde_json::Value>(package_metadata.get())?;
+
+        if let Some(cross) = package_metadata.get("cross") {
+            if let Some(found) = &found {
+                msg_info.warn(format_args!("Found conflicting cross configuration in `{}`, use `[workspace.metadata.cross]` in the workspace manifest instead.\nCurrently only using configuration from `{}`", package.to_utf8()?, found))?;
+                continue;
+            }
+            let (workspace_config, _) = CrossToml::parse_from_deserializer(
+                cross,
+                Some(metadata.workspace_root.join("Cargo.toml").to_utf8()?),
+                msg_info,
+            )?;
+            config = config.merge(workspace_config)?;
+            found = Some(package.to_utf8()?.into());
+        }
+    }
+
+    Ok(config)
 }

@@ -1,5 +1,5 @@
-FROM ubuntu:20.04
-ARG DEBIAN_FRONTEND=noninteractive
+FROM ubuntu:20.04 as cross-base
+ENV DEBIAN_FRONTEND=noninteractive
 
 COPY common.sh lib.sh /
 RUN /common.sh
@@ -9,6 +9,8 @@ RUN /cmake.sh
 
 COPY xargo.sh /
 RUN /xargo.sh
+
+FROM cross-base as build
 
 ARG TARGETPLATFORM
 COPY zig.sh /

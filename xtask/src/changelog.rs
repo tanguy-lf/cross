@@ -5,26 +5,33 @@ use std::fs;
 use std::path::Path;
 
 use crate::util::{project_dir, write_to_string};
-use chrono::{Datelike, Utc};
-use clap::Args;
 use cross::shell::MessageInfo;
 use cross::ToUtf8;
+
+use chrono::{Datelike, Utc};
+use clap::{Args, Subcommand};
 use eyre::Context;
 use serde::Deserialize;
 
+pub fn changelog(args: Changelog, msg_info: &mut MessageInfo) -> cross::Result<()> {
+    match args {
+        Changelog::Build(args) => build_changelog(args, msg_info),
+        Changelog::Validate(args) => validate_changelog(args, msg_info),
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Changelog {
+    /// Build the changelog.
+    Build(BuildChangelog),
+    /// Validate changelog entries.
+    Validate(ValidateChangelog),
+}
+
 #[derive(Args, Debug)]
 pub struct BuildChangelog {
-    /// Provide verbose diagnostic output.
-    #[clap(short, long, env = "CARGO_TERM_VERBOSE")]
-    pub verbose: bool,
-    /// Do not print cross log messages.
-    #[clap(short, long, env = "CARGO_TERM_QUIET")]
-    pub quiet: bool,
-    /// Whether messages should use color output.
-    #[clap(long, env = "CARGO_TERM_COLOR")]
-    pub color: Option<String>,
     /// Build a release changelog.
-    #[clap(long, env = "NEW_VERSION")]
+    #[clap(long, env = "NEW_VERSION", required = true)]
     release: Option<String>,
     /// Whether we're doing a dry run or not.
     #[clap(long, env = "DRY_RUN")]
@@ -35,15 +42,6 @@ pub struct BuildChangelog {
 pub struct ValidateChangelog {
     /// List of changelog entries to validate.
     files: Vec<String>,
-    /// Provide verbose diagnostic output.
-    #[clap(short, long)]
-    pub verbose: bool,
-    /// Do not print cross log messages.
-    #[clap(short, long)]
-    pub quiet: bool,
-    /// Whether messages should use color output.
-    #[clap(long)]
-    pub color: Option<String>,
 }
 
 // the type for the identifier: if it's a PR, sort
@@ -98,7 +96,7 @@ impl IdType {
 
 impl cmp::PartialOrd for IdType {
     fn partial_cmp(&self, other: &IdType) -> Option<cmp::Ordering> {
-        self.max_number().partial_cmp(&other.max_number())
+        Some(self.cmp(other))
     }
 }
 
@@ -143,7 +141,7 @@ impl ChangelogType {
 
 impl cmp::PartialOrd for ChangelogType {
     fn partial_cmp(&self, other: &ChangelogType) -> Option<cmp::Ordering> {
-        self.sort_by().partial_cmp(&other.sort_by())
+        Some(self.cmp(other))
     }
 }
 
@@ -173,7 +171,7 @@ impl ChangelogContents {
 
 impl cmp::PartialOrd for ChangelogContents {
     fn partial_cmp(&self, other: &ChangelogContents) -> Option<cmp::Ordering> {
-        self.sort_by().partial_cmp(&other.sort_by())
+        Some(self.cmp(other))
     }
 }
 
@@ -256,7 +254,7 @@ impl fmt::Display for ChangelogEntry {
                 prs.iter()
                     .map(|x| x.to_string())
                     .collect::<Vec<String>>()
-                    .join(",")
+                    .join(",#")
             ))?,
             IdType::Issue(_) => (),
         }
@@ -503,32 +501,79 @@ pub fn build_changelog(
         }
         false => "CHANGELOG.md.draft",
     };
-    write_to_string(&root.join(filename), &output)?;
+    let path = root.join(filename);
+    write_to_string(&path, &output)?;
+    #[allow(clippy::disallowed_methods)]
+    msg_info.info(format_args!("Changelog written to `{}`", path.display()))?;
 
     Ok(())
 }
 
+#[allow(clippy::disallowed_methods)]
 pub fn validate_changelog(
-    ValidateChangelog { files, .. }: ValidateChangelog,
+    ValidateChangelog { mut files, .. }: ValidateChangelog,
     msg_info: &mut MessageInfo,
 ) -> cross::Result<()> {
-    msg_info.info("Validating the changelog modifications.")?;
-
     let root = project_dir(msg_info)?;
     let changes_dir = root.join(".changes");
+    if files.is_empty() {
+        files = fs::read_dir(&changes_dir)?
+            .filter_map(|x| x.ok())
+            .filter(|x| x.file_type().map_or(false, |v| v.is_file()))
+            .filter_map(|x| {
+                if x.path()
+                    .extension()
+                    .and_then(|s: &std::ffi::OsStr| s.to_str())
+                    .unwrap_or_default()
+                    == "json"
+                {
+                    Some(x.file_name().to_utf8().unwrap().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
+    let mut errors = vec![];
     for file in files {
         let file_name = Path::new(&file);
         let path = changes_dir.join(file_name);
         let stem = file_stem(&path)?;
-        let contents =
-            fs::read_to_string(&path).wrap_err_with(|| eyre::eyre!("cannot find file {file}"))?;
-        let id = IdType::parse_stem(stem)?;
-        let value = serde_json::from_str(&contents)
-            .wrap_err_with(|| format!("unable to parse JSON for \"{file}\""))?;
-        let _ = ChangelogEntry::from_value(id, value)
-            .wrap_err_with(|| format!("unable to extract changelog from \"{file}\""))?;
+        let contents = fs::read_to_string(&path)
+            .wrap_err_with(|| eyre::eyre!("cannot find file {}", path.display()))?;
+
+        let id = match IdType::parse_stem(stem)
+            .wrap_err_with(|| format!("unable to parse file stem for \"{}\"", path.display()))
+        {
+            Ok(id) => id,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+
+        let value = match serde_json::from_str(&contents)
+            .wrap_err_with(|| format!("unable to parse JSON for \"{}\"", path.display()))
+        {
+            Ok(value) => value,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+
+        let res = ChangelogEntry::from_value(id, value)
+            .wrap_err_with(|| format!("unable to extract changelog from \"{}\"", path.display()))
+            .map(|_| ());
+        errors.extend(res.err());
     }
 
+    if !errors.is_empty() {
+        return Err(crate::util::with_section_reports(
+            eyre::eyre!("some files were not validated"),
+            errors,
+        ));
+    }
     // also need to validate the existing changelog
     let _ = read_changelog(&root)?;
 
@@ -800,7 +845,7 @@ mod tests {
         let output = build_changelog_test(None)?;
         let lines: Vec<&str> = output.lines().collect();
 
-        assert_eq!(lines[10], "- #979,981 - this has 2 PRs associated.");
+        assert_eq!(lines[10], "- #979,#981 - this has 2 PRs associated.");
         assert_eq!(lines[11], "- #940 - this is one added entry.");
         assert_eq!(
             lines[36],
@@ -814,7 +859,7 @@ mod tests {
                 "",
                 "### Added",
                 "",
-                "- #979,981 - this has 2 PRs associated.",
+                "- #979,#981 - this has 2 PRs associated.",
                 "- #940 - this is one added entry.",
             ]
         );
@@ -834,7 +879,7 @@ mod tests {
                 "",
                 "### Added",
                 "",
-                "- #979,981 - this has 2 PRs associated.",
+                "- #979,#981 - this has 2 PRs associated.",
                 "- #940 - this is one added entry.",
             ]
         );
@@ -857,7 +902,7 @@ mod tests {
                 "",
                 "### Added",
                 "",
-                "- #979,981 - this has 2 PRs associated.",
+                "- #979,#981 - this has 2 PRs associated.",
                 "- #940 - this is one added entry.",
             ]
         );

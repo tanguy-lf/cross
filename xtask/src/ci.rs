@@ -19,22 +19,14 @@ pub enum CiJob {
     },
     /// Check workspace metadata.
     Check {
-        // tag, branch
+        /// tag, branch
         #[clap(long, env = "GITHUB_REF_TYPE")]
         ref_type: String,
-        // main, v0.1.0
+        /// main, v0.1.0
         #[clap(long, env = "GITHUB_REF_NAME")]
         ref_name: String,
     },
-    TargetMatrix {
-        #[clap(long, env = "COMMIT_MESSAGE")]
-        message: String,
-        #[clap(long, env = "COMMIT_AUTHOR")]
-        author: String,
-        // check is being run as part of a weekly check
-        #[clap(long)]
-        weekly: bool,
-    },
+    TargetMatrix(target_matrix::TargetMatrix),
 }
 
 pub fn ci(args: CiJob, metadata: CargoMetadata) -> cross::Result<()> {
@@ -117,12 +109,8 @@ pub fn ci(args: CiJob, metadata: CargoMetadata) -> cross::Result<()> {
                 }
             }
         }
-        CiJob::TargetMatrix {
-            message,
-            author,
-            weekly,
-        } => {
-            target_matrix::run(message, author, weekly)?;
+        CiJob::TargetMatrix(target_matrix) => {
+            target_matrix.run()?;
         }
     }
     Ok(())

@@ -1,5 +1,5 @@
-FROM ubuntu:20.04
-ARG DEBIAN_FRONTEND=noninteractive
+FROM ubuntu:20.04 as cross-base
+ENV DEBIAN_FRONTEND=noninteractive
 
 COPY common.sh lib.sh /
 RUN /common.sh
@@ -10,6 +10,8 @@ RUN /cmake.sh
 COPY xargo.sh /
 RUN /xargo.sh
 
+FROM cross-base as build
+
 RUN echo "export ARCH=i686" > /freebsd-arch.sh
 COPY freebsd-common.sh /
 COPY freebsd.sh /
@@ -19,11 +21,15 @@ COPY freebsd-install.sh /
 COPY freebsd-extras.sh /
 RUN /freebsd-extras.sh
 
-ENV CROSS_TOOLCHAIN_PREFIX=i686-unknown-freebsd12-
-ENV CROSS_SYSROOT=/usr/local/i686-unknown-freebsd12
+ENV CROSS_TOOLCHAIN_PREFIX=i686-unknown-freebsd13-
+ENV CROSS_SYSROOT=/usr/local/i686-unknown-freebsd13
 
 COPY freebsd-gcc.sh /usr/bin/"$CROSS_TOOLCHAIN_PREFIX"gcc.sh
 COPY toolchain.cmake /opt/toolchain.cmake
+
+COPY freebsd-fetch-best-mirror.sh /
+COPY freebsd-setup-packagesite.sh /
+COPY freebsd-install-package.sh /
 
 ENV CARGO_TARGET_I686_UNKNOWN_FREEBSD_LINKER="$CROSS_TOOLCHAIN_PREFIX"gcc.sh \
     AR_i686_unknown_freebsd="$CROSS_TOOLCHAIN_PREFIX"ar \

@@ -4,9 +4,9 @@ set -x
 set -euo pipefail
 
 # shellcheck disable=SC1091
-. freebsd-common.sh
+. /freebsd-common.sh
 # shellcheck disable=SC1091
-. lib.sh
+. /lib.sh
 
 # we prefer those closer in geography to the US. they're triaged in
 # order of ease of use, reliability, and then geography. the mirror
@@ -143,7 +143,7 @@ base_release=$(latest_freebsd "${mirror}")
 bsd_url="${mirror}/${FREEBSD_ARCH}/${base_release}-RELEASE"
 
 main() {
-    local binutils=2.32 \
+    local binutils=2.40 \
         gcc=6.4.0 \
         target="${ARCH}-unknown-freebsd${FREEBSD_MAJOR}"
 
@@ -152,6 +152,7 @@ main() {
         g++ \
         make \
         wget \
+        texinfo \
         xz-utils
 
     local td
@@ -227,7 +228,7 @@ main() {
         --disable-libvtv \
         --disable-lto \
         --disable-nls \
-        --enable-languages=c,c++ \
+        --enable-languages=c,c++,fortran \
         --target="${target}"
     make "-j$(nproc)"
     make install

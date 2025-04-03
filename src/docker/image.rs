@@ -2,7 +2,12 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{errors::*, shell::MessageInfo, TargetTriple};
+use crate::{
+    docker::{CROSS_IMAGE, DEFAULT_IMAGE_VERSION},
+    errors::*,
+    shell::MessageInfo,
+    TargetTriple,
+};
 
 use super::Engine;
 
@@ -21,21 +26,26 @@ impl std::fmt::Display for Image {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PossibleImage {
-    pub name: String,
+    #[serde(rename = "name")]
+    pub reference: ImageReference,
     // The toolchain triple the image is built for
     pub toolchain: Vec<ImagePlatform>,
 }
 
 impl PossibleImage {
-    pub(crate) fn to_definite_with(&self, engine: &Engine, msg_info: &mut MessageInfo) -> Image {
+    pub fn to_definite_with(&self, engine: &Engine, msg_info: &mut MessageInfo) -> Result<Image> {
+        let ImageReference::Name(name) = self.reference.clone() else {
+            eyre::bail!("cannot make definite Image from unqualified PossibleImage");
+        };
+
         if self.toolchain.is_empty() {
-            Image {
-                name: self.name.clone(),
+            Ok(Image {
+                name,
                 platform: ImagePlatform::DEFAULT,
-            }
+            })
         } else {
             let platform = if self.toolchain.len() == 1 {
-                self.toolchain.get(0).expect("should contain at least one")
+                self.toolchain.first().expect("should contain at least one")
             } else {
                 let same_arch = self
                     .toolchain
@@ -48,7 +58,7 @@ impl PossibleImage {
 
                 if same_arch.len() == 1 {
                     // pick the platform with the same architecture
-                    same_arch.get(0).expect("should contain one element")
+                    same_arch.first().expect("should contain one element")
                 } else if let Some(platform) = same_arch
                     .iter()
                     .find(|platform| &platform.os == engine.os.as_ref().unwrap_or(&Os::Linux))
@@ -62,7 +72,7 @@ impl PossibleImage {
                 } else {
                     let platform = self
                         .toolchain
-                        .get(0)
+                        .first()
                         .expect("should be at least one platform");
                     // FIXME: Don't throw away
                     msg_info.warn(
@@ -71,10 +81,10 @@ impl PossibleImage {
                     platform
                 }
             };
-            Image {
+            Ok(Image {
                 platform: platform.clone(),
-                name: self.name.clone(),
-            }
+                name,
+            })
         }
     }
 }
@@ -82,7 +92,7 @@ impl PossibleImage {
 impl<T: AsRef<str>> From<T> for PossibleImage {
     fn from(s: T) -> Self {
         PossibleImage {
-            name: s.as_ref().to_owned(),
+            reference: s.as_ref().to_owned().into(),
             toolchain: vec![],
         }
     }
@@ -98,12 +108,60 @@ impl FromStr for PossibleImage {
 
 impl std::fmt::Display for PossibleImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.name)
+        f.write_str(self.reference.get())
     }
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(from = "String", untagged)]
+pub enum ImageReference {
+    /// Partially qualified reference, with or without tag/digest
+    Name(String),
+    /// Unqualified reference, only a tag or digest
+    Identifier(String),
+    /// Unqualified reference, only a subtarget
+    Subtarget(String),
+}
+
+impl ImageReference {
+    pub fn get(&self) -> &str {
+        match self {
+            Self::Name(s) => s,
+            Self::Identifier(s) => s,
+            Self::Subtarget(s) => s,
+        }
+    }
+
+    pub fn ensure_qualified(&mut self, target_name: &str) {
+        let image_name = match self {
+            Self::Name(_) => return,
+            Self::Identifier(id) => {
+                format!("{CROSS_IMAGE}/{target_name}{id}")
+            }
+            Self::Subtarget(sub) => {
+                format!("{CROSS_IMAGE}/{target_name}:{DEFAULT_IMAGE_VERSION}{sub}")
+            }
+        };
+
+        *self = Self::Name(image_name);
+    }
+}
+
+impl From<String> for ImageReference {
+    fn from(s: String) -> Self {
+        if s.starts_with('-') {
+            Self::Subtarget(s)
+        } else if s.starts_with(':') || s.starts_with('@') {
+            Self::Identifier(s)
+        } else {
+            Self::Name(s)
+        }
+    }
+}
+
 /// The architecture/platform to use in the image
 ///
-/// https://github.com/containerd/containerd/blob/release/1.6/platforms/platforms.go#L63
+/// <https://github.com/containerd/containerd/blob/release/1.6/platforms/platforms.go#L63>
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct ImagePlatform {
@@ -131,6 +189,17 @@ impl ImagePlatform {
             format!("{}/{}/{variant}", self.os, self.architecture)
         } else {
             format!("{}/{}", self.os, self.architecture)
+        }
+    }
+
+    /// Returns a string that can be used in codegen to represent this platform
+    pub fn to_codegen_string(&self) -> Option<&'static str> {
+        match self.target {
+            TargetTriple::X86_64UnknownLinuxGnu => Some("ImagePlatform::X86_64_UNKNOWN_LINUX_GNU"),
+            TargetTriple::Aarch64UnknownLinuxGnu => {
+                Some("ImagePlatform::AARCH64_UNKNOWN_LINUX_GNU")
+            }
+            _ => None,
         }
     }
 }
@@ -163,6 +232,14 @@ impl std::str::FromStr for ImagePlatform {
             value::{Error as SerdeError, StrDeserializer},
             IntoDeserializer,
         };
+
+        // Try to match the docker platform string first
+        match s {
+            "linux/amd64" => return Ok(Self::X86_64_UNKNOWN_LINUX_GNU),
+            "linux/arm64" | "linux/arm64/v8" => return Ok(Self::AARCH64_UNKNOWN_LINUX_GNU),
+            _ => {}
+        };
+
         if let Some((platform, toolchain)) = s.split_once('=') {
             let image_toolchain = toolchain.into();
             let (os, arch, variant) = if let Some((os, rest)) = platform.split_once('/') {
@@ -212,6 +289,8 @@ pub enum Architecture {
     Riscv64,
     S390x,
     Wasm,
+    #[serde(alias = "loongarch64")]
+    LoongArch64,
 }
 
 impl Architecture {
@@ -407,6 +486,11 @@ pub mod tests {
         assert_eq!(arch!("arm-unknown-linux-gnueabihf")?, Architecture::Arm);
         assert_eq!(arch!("armv7-unknown-linux-gnueabihf")?, Architecture::Arm);
         assert_eq!(arch!("aarch64-unknown-linux-gnu")?, Architecture::Arm64);
+        assert_eq!(arch!("aarch64-unknown-freebsd")?, Architecture::Arm64);
+        assert_eq!(
+            arch!("loongarch64-unknown-linux-gnu")?,
+            Architecture::LoongArch64
+        );
         assert_eq!(arch!("mips-unknown-linux-gnu")?, Architecture::Mips);
         assert_eq!(
             arch!("mips64-unknown-linux-gnuabi64")?,
@@ -424,12 +508,40 @@ pub mod tests {
     fn os_from_target() -> Result<()> {
         assert_eq!(Os::from_target(&t!("x86_64-apple-darwin"))?, Os::Darwin);
         assert_eq!(Os::from_target(&t!("x86_64-unknown-freebsd"))?, Os::Freebsd);
+        assert_eq!(
+            Os::from_target(&t!("aarch64-unknown-freebsd"))?,
+            Os::Freebsd
+        );
+        assert_eq!(
+            Os::from_target(&t!("loongarch64-unknown-linux-gnu"))?,
+            Os::Linux
+        );
         assert_eq!(Os::from_target(&t!("x86_64-unknown-netbsd"))?, Os::Netbsd);
         assert_eq!(Os::from_target(&t!("sparcv9-sun-solaris"))?, Os::Solaris);
         assert_eq!(Os::from_target(&t!("sparcv9-sun-illumos"))?, Os::Illumos);
         assert_eq!(Os::from_target(&t!("aarch64-linux-android"))?, Os::Android);
         assert_eq!(Os::from_target(&t!("x86_64-unknown-linux-gnu"))?, Os::Linux);
         assert_eq!(Os::from_target(&t!("x86_64-pc-windows-msvc"))?, Os::Windows);
+        Ok(())
+    }
+
+    #[test]
+    fn image_platform_from_docker_platform_str() -> Result<()> {
+        assert_eq!(
+            "linux/amd64".parse::<ImagePlatform>()?,
+            ImagePlatform::X86_64_UNKNOWN_LINUX_GNU
+        );
+
+        assert_eq!(
+            "linux/arm64".parse::<ImagePlatform>()?,
+            ImagePlatform::AARCH64_UNKNOWN_LINUX_GNU
+        );
+
+        assert_eq!(
+            "linux/arm64/v8".parse::<ImagePlatform>()?,
+            ImagePlatform::AARCH64_UNKNOWN_LINUX_GNU
+        );
+
         Ok(())
     }
 }

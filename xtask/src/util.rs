@@ -64,6 +64,12 @@ pub struct CiTarget {
     /// if `true` test no std support as if std does exists. If `false` build https://github.com/rust-lang/compiler-builtins
     #[serde(skip_serializing_if = "Option::is_none")]
     pub std: Option<bool>,
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub disabled: bool,
+}
+
+pub fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl CiTarget {
@@ -116,6 +122,16 @@ pub fn get_matrix() -> &'static Vec<CiTarget> {
             Ok(targets.target)
         })
         .unwrap()
+}
+
+pub fn with_section_reports(
+    origin: eyre::Report,
+    iter: impl IntoIterator<Item = eyre::Report>,
+) -> eyre::Report {
+    use color_eyre::{Section as _, SectionExt as _};
+    iter.into_iter().fold(origin, |report, e| {
+        report.section(format!("{e:?}").header("Error:"))
+    })
 }
 
 pub fn format_repo(registry: &str, repository: &str) -> String {
@@ -245,7 +261,6 @@ pub fn has_nightly(msg_info: &mut MessageInfo) -> cross::Result<bool> {
         .arg("+nightly")
         .run_and_get_output(msg_info)
         .map(|o| o.status.success())
-        .map_err(Into::into)
 }
 
 pub fn get_channel_prefer_nightly<'a>(
@@ -262,9 +277,12 @@ pub fn get_channel_prefer_nightly<'a>(
 }
 
 pub fn cargo(channel: Option<&str>) -> Command {
-    let mut command = cross::cargo_command();
+    let mut command;
     if let Some(channel) = channel {
-        command.arg(&format!("+{channel}"));
+        command = Command::new("rustup");
+        command.args(["run", channel, "cargo"]);
+    } else {
+        command = cross::cargo_command();
     }
     command
 }
@@ -322,6 +340,33 @@ pub fn read_dockerfiles(msg_info: &mut MessageInfo) -> cross::Result<Vec<(PathBu
     }
 
     Ok(dockerfiles)
+}
+
+pub fn write_to_string(path: &Path, contents: &str) -> cross::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(path)?;
+    writeln!(file, "{}", contents)?;
+    Ok(())
+}
+
+// https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#environment-files
+pub fn write_to_gha_env_file(env_name: &str, contents: &str) -> cross::Result<()> {
+    eprintln!("{contents}");
+    let path = if let Ok(path) = env::var(env_name) {
+        PathBuf::from(path)
+    } else {
+        eyre::ensure!(
+            env::var("GITHUB_ACTIONS").is_err(),
+            "expected GHA envfile to exist"
+        );
+        return Ok(());
+    };
+    let mut file = fs::OpenOptions::new().append(true).open(path)?;
+    writeln!(file, "{}", contents)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -403,23 +448,4 @@ mod tests {
             Ok(())
         }
     }
-}
-
-pub fn write_to_string(path: &Path, contents: &str) -> cross::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(path)?;
-    writeln!(file, "{}", contents)?;
-    Ok(())
-}
-
-// https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#environment-files
-pub fn write_to_gha_env_file(env_name: &str, contents: &str) -> cross::Result<()> {
-    let path = env::var(env_name)?;
-    let path = Path::new(&path);
-    let mut file = fs::OpenOptions::new().append(true).open(path)?;
-    writeln!(file, "{}", contents)?;
-    Ok(())
 }

@@ -29,17 +29,8 @@ pub struct BuildDockerImage {
     pub repository: String,
     /// Newline separated labels
     #[clap(long, env = "LABELS")]
-    pub labels: Option<String>,
-    /// Provide verbose diagnostic output.
-    #[clap(short, long, action = clap::ArgAction::Count)]
-    pub verbose: u8,
-    /// Do not print cross log messages.
-    #[clap(short, long)]
-    pub quiet: bool,
-    /// Coloring: auto, always, never
-    #[clap(long)]
-    pub color: Option<String>,
     /// Print but do not execute the build commands.
+    pub labels: Option<String>,
     #[clap(long)]
     pub dry_run: bool,
     /// Force a push when `--push` is set, but not `--tag`
@@ -146,6 +137,7 @@ pub fn build_docker_image(
             targets = get_matrix()
                 .iter()
                 .filter(|m| m.os.starts_with("ubuntu"))
+                .filter(|m| !m.disabled)
                 .map(|m| m.to_image_target())
                 .collect();
         } else {
@@ -350,10 +342,11 @@ pub fn build_docker_image(
         std::env::set_var("GITHUB_STEP_SUMMARY", job_summary(&results)?);
     }
     if results.iter().any(|r| r.is_err()) {
-        results
-            .into_iter()
-            .filter_map(Result::err)
-            .fold(Err(eyre::eyre!("encountered error(s)")), |_, e| Err(e.1))?;
+        #[allow(unknown_lints, clippy::manual_try_fold)]
+        return Err(crate::util::with_section_reports(
+            eyre::eyre!("some error(s) encountered"),
+            results.into_iter().filter_map(Result::err).map(|e| e.1),
+        ));
     }
     Ok(())
 }
@@ -402,7 +395,7 @@ pub fn determine_image_name(
 ) -> cross::Result<Vec<String>> {
     let mut tags = vec![];
     match (ref_type, ref_name) {
-        (ref_type, ref_name) if ref_type == "tag" && ref_name.starts_with('v') => {
+        ("tag", ref_name) if ref_name.starts_with('v') => {
             let tag_version = ref_name
                 .strip_prefix('v')
                 .expect("tag name should start with v");
@@ -415,8 +408,15 @@ pub fn determine_image_name(
                 tags.push(target.image_name(repository, "latest"))
             }
         }
-        (ref_type, ref_name) if ref_type == "branch" => {
-            tags.push(target.image_name(repository, ref_name));
+        ("branch", ref_name) => {
+            if let Some(gh_queue) = ref_name.strip_prefix("gh-readonly-queue/") {
+                let (_, source) = gh_queue
+                    .split_once('/')
+                    .ok_or_else(|| eyre::eyre!("invalid gh-readonly-queue branch name"))?;
+                tags.push(target.image_name(repository, source));
+            } else {
+                tags.push(target.image_name(repository, ref_name));
+            }
 
             if ["staging", "trying"]
                 .iter()
