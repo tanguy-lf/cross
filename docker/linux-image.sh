@@ -57,7 +57,7 @@ max_kernel_version() {
 main() {
     # arch in the rust target
     local arch="${1}" \
-        kversion=6.1.0-31
+        kversion=6.1.0-37
 
     local debsource="deb http://http.debian.net/debian/ bookworm main"
     debsource="${debsource}\ndeb http://security.debian.org/ bookworm-security main"
